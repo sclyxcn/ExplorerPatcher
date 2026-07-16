@@ -518,10 +518,24 @@ jobs:
           fi
 
           if [ "$SYNC_LATEST_ONLY" == "true" ]; then
-            RELEASES=$(echo "$ALL_RELEASES" | jq '[.[0]]')
+            # 优先取最新的正式版（跳过 Pre-release）
+            # GitHub API 按 created_at 降序，最新创建的可能是 Pre-release
+            # 如果只同步 Pre-release，GitHub 主页侧边栏不会显示为 Latest
+            RELEASES=$(echo "$ALL_RELEASES" | jq '[.[] | select(.prerelease == false)] | .[0:1]')
+            STABLE_COUNT=$(echo "$RELEASES" | jq '. | length')
+            if [ "$STABLE_COUNT" -eq 0 ]; then
+              echo "⚠️ 上游没有正式版，回退到最新的 Pre-release"
+              RELEASES=$(echo "$ALL_RELEASES" | jq '[.[0]]')
+            else
+              echo "✅ 已选择最新的正式版（跳过 Pre-release）"
+            fi
             RELEASE_COUNT=1
             LATEST_TAG=$(echo "$RELEASES" | jq -r '.[0].tag_name')
-            echo "📌 最新 Release: $LATEST_TAG"
+            LATEST_PRERELEASE=$(echo "$RELEASES" | jq -r '.[0].prerelease')
+            echo "📌 最新 Release: $LATEST_TAG (Pre-release: $LATEST_PRERELEASE)"
+            echo ""
+            echo "📊 上游 Release 概览："
+            echo "$ALL_RELEASES" | jq -r '.[] | "   \(.tag_name) | Pre-release: \(.prerelease) | \(.created_at)"' | head -5
           else
             RELEASES="$ALL_RELEASES"
             RELEASE_COUNT="$TOTAL_COUNT"
@@ -744,10 +758,6 @@ jobs:
 
           echo "📊 当前 Release 数量: $TOTAL_COUNT"
           echo "🔒 本次同步保护的 tag: $SYNCED_TAGS"
-
-          LATEST_TAG=$(echo "$RELEASE_LIST" | jq -r '.[0].tagName')
-
-          echo "📌 最新 Release: $LATEST_TAG"
           echo ""
 
           DELETED_COUNT=0
@@ -755,12 +765,8 @@ jobs:
           while read -r release; do
             TAG_NAME=$(echo "$release" | jq -r '.tagName')
 
-            # 跳过最新的
-            if [ "$TAG_NAME" == "$LATEST_TAG" ]; then
-              continue
-            fi
-
-            # 跳过本次刚同步的 tag（防止 API 延迟导致误删）
+            # 只保护本次刚同步的 tag，其余全部删除
+            # （包括旧的 Pre-release、旧正式版等）
             if echo "$SYNCED_TAGS" | grep -qw "$TAG_NAME"; then
               echo "   🔒 保护刚同步的: $TAG_NAME"
               continue
