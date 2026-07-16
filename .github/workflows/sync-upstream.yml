@@ -567,6 +567,7 @@ jobs:
           RELEASES=$(cat /tmp/upstream_releases.json)
 
           SYNCED_COUNT=0
+          SYNCED_TAGS=""
           while read -r release; do
             TAG_NAME=$(echo "$release" | jq -r '.tag_name')
             RELEASE_NAME=$(echo "$release" | jq -r '.name')
@@ -647,6 +648,7 @@ jobs:
 
             # Release 已存在或创建成功
             SYNCED_COUNT=$((SYNCED_COUNT + 1))
+            SYNCED_TAGS="$SYNCED_TAGS $TAG_NAME"
 
             # --- 处理制品 ---
             if [ "$ASSET_COUNT" == "null" ] || [ "$ASSET_COUNT" -eq 0 ]; then
@@ -702,6 +704,8 @@ jobs:
           echo "✅ Release 同步完成（成功: $SYNCED_COUNT）"
           if [ "$SYNCED_COUNT" -gt 0 ]; then
             echo "sync_success=true" >> $GITHUB_OUTPUT
+            # 输出已同步的 tag 列表（空格分隔），供步骤10保护
+            echo "synced_tags=$SYNCED_TAGS" >> $GITHUB_OUTPUT
           fi
 
       # ============================================
@@ -722,8 +726,14 @@ jobs:
           echo "=========================================="
 
           CURRENT_REPO="${{ github.repository }}"
+          # 步骤9同步的 tag 列表（空格分隔），这些 tag 永不删除
+          SYNCED_TAGS="${{ steps.sync_releases.outputs.synced_tags }}"
 
-          RELEASE_LIST=$(gh release list --repo "$CURRENT_REPO" --limit 100 --json tagName)
+          # 等待 API 索引刷新（步骤9刚创建的 release 可能还没出现在列表中）
+          sleep 3
+
+          # 按 createdAt 降序排列，确保最新的在前面
+          RELEASE_LIST=$(gh release list --repo "$CURRENT_REPO" --limit 100 --json tagName,createdAt | jq 'sort_by(.createdAt) | reverse')
 
           TOTAL_COUNT=$(echo "$RELEASE_LIST" | jq '. | length')
 
@@ -733,6 +743,7 @@ jobs:
           fi
 
           echo "📊 当前 Release 数量: $TOTAL_COUNT"
+          echo "🔒 本次同步保护的 tag: $SYNCED_TAGS"
 
           LATEST_TAG=$(echo "$RELEASE_LIST" | jq -r '.[0].tagName')
 
@@ -744,11 +755,20 @@ jobs:
           while read -r release; do
             TAG_NAME=$(echo "$release" | jq -r '.tagName')
 
-            if [ "$TAG_NAME" != "$LATEST_TAG" ]; then
-              echo "   🗑️ 删除: $TAG_NAME"
-              gh release delete "$TAG_NAME" --yes --repo "$CURRENT_REPO" --cleanup-tag 2>/dev/null || true
-              DELETED_COUNT=$((DELETED_COUNT + 1))
+            # 跳过最新的
+            if [ "$TAG_NAME" == "$LATEST_TAG" ]; then
+              continue
             fi
+
+            # 跳过本次刚同步的 tag（防止 API 延迟导致误删）
+            if echo "$SYNCED_TAGS" | grep -qw "$TAG_NAME"; then
+              echo "   🔒 保护刚同步的: $TAG_NAME"
+              continue
+            fi
+
+            echo "   🗑️ 删除: $TAG_NAME"
+            gh release delete "$TAG_NAME" --yes --repo "$CURRENT_REPO" 2>/dev/null || true
+            DELETED_COUNT=$((DELETED_COUNT + 1))
           done < <(echo "$RELEASE_LIST" | jq -c '.[]')
 
           echo ""
