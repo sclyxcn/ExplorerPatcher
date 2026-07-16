@@ -20,7 +20,9 @@
 #
 # 【注意事项】
 #   - 无需设置 secrets 或 PAT，使用 GitHub 内置 token
-#   - 无需修改仓库 Settings 权限，workflow 自行声明 permissions
+#   - 需开启仓库写权限（一次性设置）：
+#       仓库 → Settings → Actions → General → Workflow permissions
+#       → 选择 "Read and write permissions" → Save
 #   - 上游 workflow 文件会自动删除，只保留本文件
 #   - 同步代码时自动保留本地 workflows（不会被上游覆盖）
 #   - 如遇失败，重跑一次即可自动恢复（幂等设计）
@@ -580,7 +582,7 @@ jobs:
 
             # --- 创建 Tag（用 git 命令，不走 API，避免 403）---
             if git tag -l "$TAG_NAME" | grep -q .; then
-              echo "   ⚠️ Tag 已存在"
+              echo "   ⚠️ 本地 Tag 已存在"
               if [ "$SYNC_MODE" == "force" ]; then
                 echo "   🔄 强制模式：删除并重建 Tag..."
                 git tag -d "$TAG_NAME" 2>/dev/null || true
@@ -588,24 +590,27 @@ jobs:
               fi
             fi
 
+            # 创建本地 tag 并推送到远端（走 git 协议，不走 API）
             if ! git tag -l "$TAG_NAME" | grep -q .; then
-              git tag "$TAG_NAME" "$TARGET_SHA" 2>/dev/null || true
-              if ! git push origin "$TAG_NAME" 2>/dev/null; then
-                echo "   ⚠️ Tag 推送失败（远端可能已存在），gh release create 会自动处理"
-                git tag -d "$TAG_NAME" 2>/dev/null || true
+              git tag "$TAG_NAME" "$TARGET_SHA"
+              if git push origin "$TAG_NAME" 2>&1; then
+                echo "   ✅ Tag 推送成功"
+              else
+                echo "   ⚠️ Tag 推送失败，尝试强制推送..."
+                git push origin "$TAG_NAME" --force 2>&1 || {
+                  echo "   ❌ Tag 推送失败，无法继续"
+                  continue
+                }
               fi
             fi
 
-            # --- 处理 Release（用 gh release，不走 API，避免 403）---
+            # --- 处理 Release（用 gh release，tag 已通过 git 创建）---
             if gh release view "$TAG_NAME" --repo "$CURRENT_REPO" > /dev/null 2>&1; then
               echo "   ⚠️ Release 已存在"
               if [ "$SYNC_MODE" == "force" ]; then
                 echo "   🔄 强制模式：删除并重建 Release..."
-                gh release delete "$TAG_NAME" --yes --repo "$CURRENT_REPO" --cleanup-tag 2>/dev/null || true
+                gh release delete "$TAG_NAME" --yes --repo "$CURRENT_REPO" 2>/dev/null || true
                 sleep 2
-                # 重新创建 tag（上面被 --cleanup-tag 删了）
-                git tag "$TAG_NAME" "$TARGET_SHA" 2>/dev/null || true
-                git push origin "$TAG_NAME" 2>/dev/null || true
                 echo "   ✅ Release 已删除"
               fi
             fi
@@ -622,15 +627,17 @@ jobs:
                 PRERELEASE_FLAG="--prerelease"
               fi
 
+              # 不带 --target，使用已存在的 tag（避免 API 创建 tag 触发 403）
               if gh release create "$TAG_NAME" \
                 --repo "$CURRENT_REPO" \
-                --target "$TARGET_SHA" \
                 --title "$RELEASE_NAME" \
                 --notes-file "$BODY_FILE" \
                 $PRERELEASE_FLAG; then
                 echo "   ✅ Release 创建成功"
               else
                 echo "   ❌ Release 创建失败"
+                echo "   ⚠️ 请检查仓库 Settings → Actions → General → Workflow permissions"
+                echo "   ⚠️ 需要选择 'Read and write permissions'"
                 rm -f "$BODY_FILE"
                 continue
               fi
@@ -890,8 +897,10 @@ jobs:
             echo "✅ 最近 ${DAYS_SINCE} 天内有保活提交，跳过"
           else
             echo "⚠️ 距上次提交已 ${DAYS_SINCE} 天，创建保活提交..."
+            # 先拉取远端最新（sync job 可能已推送新提交）
+            git pull --rebase origin "$(git branch --show-current)" 2>/dev/null || true
             git commit --allow-empty -m "[skip ci] keepalive: 仓库保活 $(date -u '+%Y-%m-%d')"
-            git push origin "$(git branch --show-current)"
+            git push origin "$(git branch --show-current)" --force-with-lease
             echo "✅ 保活提交已推送"
           fi
 
